@@ -1,4 +1,4 @@
-# Time Message - an macOS iMessage Backup Script
+# Time Message - a macOS iMessage Backup Script
 *inspired by the shell script [ahmbay/backup-iMessageBackup-macos](https://github.com/ahmbay/backup-iMessageBackup-macos/blob/master/iMessageBackup.sh)*
 
 This script backs up locally stored conversations of timestamped texts and available attachements.
