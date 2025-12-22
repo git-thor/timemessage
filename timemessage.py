@@ -114,7 +114,6 @@ class TimeMessageBackup:
         for id, date, text in self.cursor.execute(query):
             ts = date // 1000000000 + ts_offset
             timestamp = datetime.datetime.fromtimestamp(int(ts))
-            # timestamp = datetime.datetime(int(date/100000000) + offset, "unixepoch", "utc")
             if id == 1:
                 participant = "me"
             elif id == 0:
@@ -142,7 +141,6 @@ class TimeMessageBackup:
 
                 messages.update(backup)
             except Exception:
-                # traceback.log.info_exc()
                 pass
 
             with open(f"{self.config.output_directory}/{contact}/history.json", "w", encoding="utf8") as f:
