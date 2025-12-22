@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Iterable
 
-from loguru import logger
+from loguru import logger as log
 from rich.console import Console
 from rich.progress import (
     Progress,
@@ -38,15 +38,9 @@ from rich.progress import (
 from beartype import beartype
 
 
-# ------------------------------
-# Globals
-# ------------------------------
 console = Console()
 
 
-# ------------------------------
-# Configuration Dataclass
-# ------------------------------
 @dataclass
 class Config:
     """Configuration for the backup run.
@@ -66,9 +60,6 @@ class Config:
     loglevel: str = "INFO"
 
 
-# ------------------------------
-# SQLite helper
-# ------------------------------
 @beartype
 @contextmanager
 def sqlite_connection(path: Path):
@@ -88,9 +79,6 @@ def sqlite_connection(path: Path):
         conn.close()
 
 
-# ------------------------------
-# Utility functions
-# ------------------------------
 @beartype
 def normalize_guid(guid: str) -> str:
     """Strip common iMessage/SMS prefixes from a chat.guid.
@@ -151,7 +139,7 @@ def load_existing_history(path: Path) -> list:
             if isinstance(data, dict):
                 return list(data.values())
     except Exception as exc:
-        logger.warning(f"Failed to read existing history {path}: {exc}")
+        log.warning(f"Failed to read existing history {path}: {exc}")
     return []
 
 
@@ -179,9 +167,6 @@ def dedupe_messages(messages: Iterable[dict]) -> list:
     return out
 
 
-# ------------------------------
-# Main Backup Class
-# ------------------------------
 class TimeMessageBackup:
     """Main class handling backing up chat messages and attachments into an output folder.
 
@@ -209,20 +194,18 @@ class TimeMessageBackup:
         # Temporary working directory
         self.temp_dir = tempfile.TemporaryDirectory(prefix="time_message_")
         self.temp_path = Path(self.temp_dir.name)
-        logger.debug(f"Temporary working directory: {self.temp_path}")
+        log.debug(f"Temporary working directory: {self.temp_path}")
 
         # Copy only the chat.db file into temp for safe reads
         self.db_path = self.temp_path / config.database.name
         try:
             shutil.copy2(config.database, self.db_path)
-            logger.info(
-                f"📁 Copied chat database to temporary location: {self.db_path}"
-            )
+            log.info(f"📁 Copied chat database to temporary location: {self.db_path}")
             console.print(
                 f"📁 Copied chat database to temporary location: [bold]{self.db_path}[/]"
             )
         except PermissionError:
-            logger.error(
+            log.error(
                 f"❌ Cannot access database at {config.database}. "
                 "Make sure your Terminal has Full Disk Access (System Settings → Privacy & Security → Full Disk Access)."
             )
@@ -232,7 +215,7 @@ class TimeMessageBackup:
             )
             raise
         except FileNotFoundError:
-            logger.error(f"❌ Database file not found: {config.database}")
+            log.error(f"❌ Database file not found: {config.database}")
             console.print(f"❌ [red]Database file not found:[/red] {config.database}")
             raise
 
@@ -241,9 +224,9 @@ class TimeMessageBackup:
         """Cleanup the temporary working directory."""
         try:
             self.temp_dir.cleanup()
-            logger.info("🧹 Temporary working directory cleaned up.")
+            log.info("🧹 Temporary working directory cleaned up.")
         except Exception as exc:
-            logger.warning(f"Failed to cleanup temp directory: {exc}")
+            log.warning(f"Failed to cleanup temp directory: {exc}")
 
     @beartype
     def list_conversations(self) -> list:
@@ -267,7 +250,7 @@ class TimeMessageBackup:
             if c not in seen:
                 seen.add(c)
                 unique.append(c)
-        logger.info(f"🔎 Found {len(unique)} conversations")
+        log.info(f"🔎 Found {len(unique)} conversations")
         return unique
 
     @beartype
@@ -277,7 +260,7 @@ class TimeMessageBackup:
         Args:
             contact: Contact identifier string.
         """
-        logger.info(f"💬 Backing up messages for {contact}")
+        log.info(f"💬 Backing up messages for {contact}")
         guid = f"iMessage;-;{contact}"
         query = """
             SELECT is_from_me, date, text
@@ -323,7 +306,7 @@ class TimeMessageBackup:
         combined = dedupe_messages(existing + messages)
         with history_file.open("w", encoding="utf8") as fh:
             json.dump(combined, fh, indent=4, ensure_ascii=False)
-        logger.success(f"✅ Saved {len(combined)} messages to {history_file}")
+        log.success(f"✅ Saved {len(combined)} messages to {history_file}")
         console.print(
             f"✅ Saved [bold]{len(combined)}[/bold] messages to [green]{history_file}[/]"
         )
@@ -401,18 +384,18 @@ class TimeMessageBackup:
             for src in source_paths:
                 try:
                     if not src.exists():
-                        logger.warning(f"Attachment not found or inaccessible: {src}")
+                        log.warning(f"Attachment not found or inaccessible: {src}")
                         progress.advance(task)
                         continue
                     dest = dest_base / src.name
                     shutil.copy2(src, dest)
                     copied.append(dest)
                 except PermissionError:
-                    logger.warning(f"Permission denied copying attachment: {src}")
+                    log.warning(f"Permission denied copying attachment: {src}")
                 except Exception as exc:
-                    logger.warning(f"Failed to copy {src}: {exc}")
+                    log.warning(f"Failed to copy {src}: {exc}")
                 progress.advance(task)
-        logger.info(f"Copied {len(copied)}/{total} attachments to temp")
+        log.info(f"Copied {len(copied)}/{total} attachments to temp")
         return copied
 
     @beartype
@@ -430,7 +413,7 @@ class TimeMessageBackup:
         console.print(f"📎 Processing attachments for [bold]{contact}[/bold]...")
         sources = self._attachment_sources_for_contact(contact)
         if not sources:
-            logger.info(f"No attachments found for {contact}")
+            log.info(f"No attachments found for {contact}")
             console.print(f"ℹ️  No attachments found for {contact}")
             return
 
@@ -463,10 +446,10 @@ class TimeMessageBackup:
                     # final write
                     shutil.copy2(tpath, dest_dir)
                 except Exception as exc:
-                    logger.warning(f"Failed to copy {tpath} -> {dest_dir}: {exc}")
+                    log.warning(f"Failed to copy {tpath} -> {dest_dir}: {exc}")
                 progress.advance(task)
 
-        logger.success(f"📁 Attachments for {contact} copied to {dest_dir}")
+        log.success(f"📁 Attachments for {contact} copied to {dest_dir}")
         console.print(
             f"📁 Attachments for [bold]{contact}[/bold] copied to [green]{dest_dir}[/green]"
         )
@@ -481,7 +464,7 @@ class TimeMessageBackup:
         try:
             for c in contacts:
                 console.rule(f"🔹 Backing up {c}")
-                logger.info(f"----- Contact: {c} -----")
+                log.info(f"----- Contact: {c} -----")
                 self.backup_chat(c)
                 if self.config.include_attachments:
                     self.backup_attachments(c)
@@ -489,9 +472,6 @@ class TimeMessageBackup:
             self.cleanup()
 
 
-# ------------------------------
-# CLI
-# ------------------------------
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build and return the argument parser for the CLI."""
     p = argparse.ArgumentParser(
@@ -564,11 +544,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     # Configure loguru
-    logger.remove()
-    logger.add(lambda msg: print(msg, end=""), level=cfg.loglevel.upper())
+    log.remove()
+    log.add(lambda msg: print(msg, end=""), level=cfg.loglevel.upper())
 
     if not cfg.database.exists():
-        logger.error(f"❌ Database not found: {cfg.database}")
+        log.error(f"❌ Database not found: {cfg.database}")
         console.print(f"❌ [red]Database not found:[/red] {cfg.database}")
         return 2
 
@@ -578,51 +558,59 @@ def main(argv: Optional[list[str]] = None) -> int:
         # message already logged / printed
         return 3
 
-    if args.command == "list":
-        contacts = backup.list_conversations()
-        for c in contacts:
-            console.print(f"• {c}")
-        # cleanup before exit
-        backup.cleanup()
-        return 0
-
-    if args.command == "backup":
-        contacts = args.contact or backup.list_conversations()
-        if not contacts:
-            logger.info("ℹ️ No conversations found to backup.")
-            console.print("ℹ️  No conversations found to backup.")
+    try:
+        if args.command == "list":
+            contacts = backup.list_conversations()
+            for c in contacts:
+                console.print(f"• {c}")
+            # cleanup before exit
             backup.cleanup()
             return 0
 
-        console.print(
-            f"📦 Backing up [bold]{len(contacts)}[/bold] conversation(s) to [green]{cfg.output}[/green]"
-        )
-        if not cfg.yes and not args.dry_run:
-            if not confirm(
-                f"Really backup {len(contacts)} conversation(s) from {cfg.database} to {cfg.output}?"
-            ):
-                logger.info("Abort by user")
-                console.print("Abort by user")
+        if args.command == "backup":
+            contacts = args.contact or backup.list_conversations()
+            if not contacts:
+                log.info("ℹ️ No conversations found to backup.")
+                console.print("ℹ️  No conversations found to backup.")
                 backup.cleanup()
                 return 0
 
-        if args.dry_run:
-            for c in contacts:
-                console.print(
-                    f"Would backup: {c} (attachments: {cfg.include_attachments})"
-                )
-            backup.cleanup()
+            console.print(
+                f"📦 Backing up [bold]{len(contacts)}[/bold] conversation(s) to [green]{cfg.output}[/green]"
+            )
+            if not cfg.yes and not args.dry_run:
+                if not confirm(
+                    f"Really backup {len(contacts)} conversation(s) from {cfg.database} to {cfg.output}?"
+                ):
+                    log.info("Abort by user")
+                    console.print("Abort by user")
+                    backup.cleanup()
+                    return 0
+
+            if args.dry_run:
+                for c in contacts:
+                    console.print(
+                        f"Would backup: {c} (attachments: {cfg.include_attachments})"
+                    )
+                backup.cleanup()
+                return 0
+
+            backup.backup_all(contacts)
+            log.success(f"🎉 Backups stored in {cfg.output}")
+            console.print(f"🎉 Backups stored in [bold]{cfg.output}[/bold]")
             return 0
 
-        backup.backup_all(contacts)
-        logger.success(f"🎉 Backups stored in {cfg.output}")
-        console.print(f"🎉 Backups stored in [bold]{cfg.output}[/bold]")
-        return 0
-
-    logger.error("Unknown command")
-    backup.cleanup()
-    return 1
+        log.error("Unknown command")
+    except Exception as e:
+        log.exception(repr(e))
+    finally:
+        backup.cleanup()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        log.exception(repr(e))
