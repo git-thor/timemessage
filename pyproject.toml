@@ -1,6 +1,6 @@
 [project]
 name = "timemessage"
-version = "0.2.0"
+version = "0.2.1"
 description = "iMessage backup utility"
 authors = [{ name = "Thomas Rudolf", email = "thomas.rudolf@kit.edu" }]
 requires-python = ">=3.12"

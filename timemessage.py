@@ -9,6 +9,8 @@ for each contact, copies accessible attachments into temp before writing the
 final backup to the output directory. The temporary working directory is
 cleaned up automatically.
 
+⚠️ The `timemessage` runtime needs to access the iMessage Library folder within macOS. This demands full disk access to copy the individual attachments. For this purpose, the terminal running `timemessage` requires System Settings > Privacy & Security > Full Disc Access for a limited time. This has security implications and therefore the personal scrutinizing of any code, application, or runtime with such elevated access is required!
+
 Usage:
     timemessage list --db ~/Library/Messages/chat.db
     timemessage backup --db ~/Library/Messages/chat.db --out ~/iMessage.backups
@@ -190,6 +192,7 @@ class TimeMessageBackup:
         self.config = config
         self.output_dir = config.output
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        log.add(self.output_dir / "backup.log", level=self.config.loglevel.upper())
 
         # Temporary working directory
         self.temp_dir = tempfile.TemporaryDirectory(prefix="timemessage_")
@@ -199,24 +202,33 @@ class TimeMessageBackup:
         # Copy only the chat.db file into temp for safe reads
         self.db_path = self.temp_path / config.database.name
         try:
-            shutil.copy2(config.database, self.db_path)
+            try:
+                shutil.copy2(config.database, self.db_path)
+            except PermissionError:
+                log.warning(f"Permission denied copying attachment: {config.database}")
+                shutil.os.system(
+                    f"sudo cp -r {config.database.as_posix()} {self.db_path.as_posix()}"
+                )
+                log.warning(
+                    f"Instead copied with sudo {config.database} -> {self.db_path}"
+                )
             log.info(f"📁 Copied chat database to temporary location: {self.db_path}")
             console.print(
-                f"📁 Copied chat database to temporary location: [bold]{self.db_path}[/]"
+                f"📁 Copied chat database to temporary location: {self.db_path}"
             )
         except PermissionError:
             log.error(
-                f"❌ Cannot access database at {config.database}. "
+                f"Cannot access database at {config.database}. "
                 "Make sure your Terminal has Full Disk Access (System Settings → Privacy & Security → Full Disk Access)."
             )
             console.print(
-                f"❌ [red]Cannot access database at {config.database}.[/]\n"
+                f"[red]Cannot access database at {config.database}.\n"
                 "Make sure Terminal has Full Disk Access (System Settings → Privacy & Security → Full Disk Access)."
             )
             raise
         except FileNotFoundError:
-            log.error(f"❌ Database file not found: {config.database}")
-            console.print(f"❌ [red]Database file not found:[/red] {config.database}")
+            log.error(f"Database file not found: {config.database}")
+            console.print(f"[red]Database file not found:[/red] {config.database}")
             raise
 
     @beartype
@@ -307,9 +319,7 @@ class TimeMessageBackup:
         with history_file.open("w", encoding="utf8") as fh:
             json.dump(combined, fh, indent=4, ensure_ascii=False)
         log.success(f"✅ Saved {len(combined)} messages to {history_file}")
-        console.print(
-            f"✅ Saved [bold]{len(combined)}[/bold] messages to [green]{history_file}[/]"
-        )
+        console.print(f"✅ Saved {len(combined)} messages to [green]{history_file}")
 
     @beartype
     def _attachment_sources_for_contact(self, contact: str) -> list[Path]:
@@ -380,7 +390,7 @@ class TimeMessageBackup:
             TimeRemainingColumn(),
             transient=True,
         ) as progress:
-            task = progress.add_task("🔁 Copying attachments to temp", total=total)
+            task = progress.add_task("📎 Copying attachments to temp", total=total)
             for src in source_paths:
                 try:
                     if not src.exists():
@@ -388,10 +398,15 @@ class TimeMessageBackup:
                         progress.advance(task)
                         continue
                     dest = dest_base / src.name
-                    shutil.copy2(src, dest)
+                    try:
+                        shutil.copy2(src, dest)
+                    except PermissionError:
+                        log.warning(f"Permission denied copying attachment: {src}")
+                        shutil.os.system(
+                            f"sudo cp -r {src.as_posix()} {dest.as_posix()}"
+                        )
+                        log.warning(f"Instead copied with sudo {src} -> {dest}")
                     copied.append(dest)
-                except PermissionError:
-                    log.warning(f"Permission denied copying attachment: {src}")
                 except Exception as exc:
                     log.warning(f"Failed to copy {src}: {exc}")
                 progress.advance(task)
@@ -410,11 +425,11 @@ class TimeMessageBackup:
         Args:
             contact: Contact identifier.
         """
-        console.print(f"📎 Processing attachments for [bold]{contact}[/bold]...")
+        console.print(f"📎 Processing attachments for {contact}...")
         sources = self._attachment_sources_for_contact(contact)
         if not sources:
             log.info(f"No attachments found for {contact}")
-            console.print(f"ℹ️  No attachments found for {contact}")
+            console.print(f"No attachments found for {contact}")
             return
 
         # Copy originals into temp (reads original protected locations once)
@@ -439,19 +454,25 @@ class TimeMessageBackup:
             transient=True,
         ) as progress:
             task = progress.add_task(
-                f"📂 Writing attachments for {contact}", total=total
+                f"📎 Writing attachments for {contact}", total=total
             )
             for tpath in temp_copied:
                 try:
-                    # final write
-                    shutil.copy2(tpath, dest_dir)
+                    try:
+                        shutil.copy2(tpath, dest_dir)
+                    except PermissionError:
+                        log.warning(f"Permission denied copying: {tpath}")
+                        shutil.os.system(
+                            f"sudo cp -r {tpath.as_posix()} {dest_dir.as_posix()}"
+                        )
+                        log.warning(f"Instead copied with sudo {tpath} -> {dest_dir}")
                 except Exception as exc:
                     log.warning(f"Failed to copy {tpath} -> {dest_dir}: {exc}")
                 progress.advance(task)
 
         log.success(f"📁 Attachments for {contact} copied to {dest_dir}")
         console.print(
-            f"📁 Attachments for [bold]{contact}[/bold] copied to [green]{dest_dir}[/green]"
+            f"📁 [green]Attachments for {contact} copied to {dest_dir}[/green]"
         )
 
     @beartype
@@ -463,7 +484,7 @@ class TimeMessageBackup:
         """
         try:
             for c in contacts:
-                console.rule(f"🔹 Backing up {c}")
+                console.rule(f"Backing up {c}")
                 log.info(f"----- Contact: {c} -----")
                 self.backup_chat(c)
                 if self.config.include_attachments:
@@ -535,6 +556,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
+    log.warning(
+        "⚠️ The `timemessage` runtime needs to access the iMessage Library folder within macOS. This demands full disk access to copy the individual attachments. For this purpose, the terminal running `timemessage` requires System Settings > Privacy & Security > Full Disc Access for a limited time. This has security implications and therefore the personal scrutinizing of any code, application, or runtime with such elevated access is required!"
+    )
+    confirmed = confirm(
+        "Confirm if the permissions are set correctly and you want to start"
+    )
+    if not confirmed:
+        return 1
+
     cfg = Config(
         database=args.db,
         output=args.out,
@@ -548,14 +578,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     log.add(lambda msg: print(msg, end=""), level=cfg.loglevel.upper())
 
     if not cfg.database.exists():
-        log.error(f"❌ Database not found: {cfg.database}")
-        console.print(f"❌ [red]Database not found:[/red] {cfg.database}")
+        log.error(f"Database not found: {cfg.database}")
+        console.print(f"[red]Database not found:[/red] {cfg.database}")
         return 2
 
     try:
         backup = TimeMessageBackup(cfg)
-    except Exception:
-        # message already logged / printed
+    except Exception as e:
+        log.exception(repr(e))
         return 3
 
     try:
@@ -570,13 +600,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.command == "backup":
             contacts = args.contact or backup.list_conversations()
             if not contacts:
-                log.info("ℹ️ No conversations found to backup.")
-                console.print("ℹ️  No conversations found to backup.")
+                log.info("No conversations found to backup.")
+                console.print("No conversations found to backup.")
                 backup.cleanup()
                 return 0
 
             console.print(
-                f"📦 Backing up [bold]{len(contacts)}[/bold] conversation(s) to [green]{cfg.output}[/green]"
+                f"📦 Backing up {len(contacts)} conversation(s) to [green]{cfg.output}[/green]"
             )
             if not cfg.yes and not args.dry_run:
                 if not confirm(
@@ -596,8 +626,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 return 0
 
             backup.backup_all(contacts)
-            log.success(f"🎉 Backups stored in {cfg.output}")
-            console.print(f"🎉 Backups stored in [bold]{cfg.output}[/bold]")
+            log.success(f"Backups stored in {cfg.output}")
+            console.print(f"Backups stored in {cfg.output}")
             return 0
 
         log.error("Unknown command")

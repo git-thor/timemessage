@@ -17,3 +17,6 @@ dist/
 
 # IDEs
 .vscode/
+
+# OS
+.DS_Store

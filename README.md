@@ -43,6 +43,8 @@ uv tool install git+https://github.com/git-thor/timemessage.git
 
 This installs the `timemessage` CLI globally.
 
+⚠️ The `timemessage` runtime needs to access the iMessage Library folder within macOS. This demands full disk access to copy the individual attachments. For this purpose, the terminal running `timemessage` requires System Settings > Privacy & Security > Full Disc Access for a limited time. This has security implications and therefore the personal scrutinizing of any code, application, or runtime with such elevated access is required!
+
 ---
 
 ## Usage
