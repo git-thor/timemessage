@@ -259,7 +259,6 @@ def main():
 
     config = argumentParser.parse_args()
 
-
     if not config.database_directory:
         config.database_directory = pathlib.Path.home().joinpath("Library", "Messages", "chat.db")
         log.info("No explicit path given as argument, using system standard.")
