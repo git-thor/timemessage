@@ -1,287 +1,628 @@
+#!/usr/bin/env python3
 """
-MIT License
+time_message_backup.py
 
-Copyright (c) 2021 Thomas Rudolf
+Modern iMessage backup tool using Loguru, Rich, and beartype for Python 3.12+.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This script copies the chat database into a temporary working directory and,
+for each contact, copies accessible attachments into temp before writing the
+final backup to the output directory. The temporary working directory is
+cleaned up automatically.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Usage:
+    time_message_backup list --db ~/Library/Messages/chat.db
+    time_message_backup backup --db ~/Library/Messages/chat.db --out ~/iMessage.backups
 """
 
-
-import logging
 import argparse
-import sys
-import pathlib
-import os
-import sqlite3
-import datetime
-import time
-import threading
 import json
 import shutil
+import sqlite3
+import time
+import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Iterable
+
+from loguru import logger
+from rich.console import Console
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    BarColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from beartype import beartype
 
 
-log = logging.getLogger()
+# ------------------------------
+# Globals
+# ------------------------------
+console = Console()
 
 
+# ------------------------------
+# Configuration Dataclass
+# ------------------------------
+@dataclass
+class Config:
+    """Configuration for the backup run.
+
+    Attributes:
+        database: Path to the chat.db SQLite file.
+        output: Path to directory where backups will be written.
+        yes: Skip confirmation prompts.
+        include_attachments: Whether to include attachments.
+        loglevel: Log level for Loguru.
+    """
+
+    database: Path
+    output: Path
+    yes: bool = False
+    include_attachments: bool = True
+    loglevel: str = "INFO"
+
+
+# ------------------------------
+# SQLite helper
+# ------------------------------
+@beartype
+@contextmanager
+def sqlite_connection(path: Path):
+    """Context manager yielding an sqlite3.Connection with row factory set.
+
+    Args:
+        path: Path to SQLite database file.
+
+    Yields:
+        sqlite3.Connection: open sqlite connection
+    """
+    conn = sqlite3.connect(path.as_posix())
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+# ------------------------------
+# Utility functions
+# ------------------------------
+@beartype
+def normalize_guid(guid: str) -> str:
+    """Strip common iMessage/SMS prefixes from a chat.guid.
+
+    Args:
+        guid: Raw guid value from chat table.
+
+    Returns:
+        Normalized contact identifier string.
+    """
+    for prefix in ("iMessage;+;", "iMessage;-;", "SMS;+;", "SMS;-;", "tel;+;"):
+        if guid.startswith(prefix):
+            return guid[len(prefix) :]
+    return guid.replace("chat", "")
+
+
+@beartype
+def apple_time_to_unix_seconds(value: int | float) -> int:
+    """Convert Apple/CoreData timestamp variants to Unix seconds.
+
+    Apple epoch starts at 2001-01-01; some fields can be in ns/ms/secs.
+    Heuristics are used to detect scale.
+
+    Args:
+        value: numeric timestamp from DB
+
+    Returns:
+        Unix timestamp (int seconds).
+    """
+    APPLE_TO_UNIX = 978307200
+    v = float(value)
+    if v > 1e15:
+        v /= 1e9
+    elif v > 1e12:
+        v /= 1e3
+    if v < 1e10:
+        return int(round(v + APPLE_TO_UNIX))
+    return int(round(v))
+
+
+@beartype
+def load_existing_history(path: Path) -> list:
+    """Load existing history.json if present.
+
+    Args:
+        path: Path to history.json file.
+
+    Returns:
+        List of message dicts (possibly empty).
+    """
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf8") as fh:
+            data = json.load(fh)
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                return list(data.values())
+    except Exception as exc:
+        logger.warning(f"Failed to read existing history {path}: {exc}")
+    return []
+
+
+@beartype
+def dedupe_messages(messages: Iterable[dict]) -> list:
+    """Deduplicate messages by (unixtimestamp, participant, text).
+
+    Keeps first occurrence and sorts chronologically.
+
+    Args:
+        messages: Iterable of message dicts.
+
+    Returns:
+        Sorted list of unique messages.
+    """
+    seen = set()
+    out = []
+    for m in messages:
+        key = (m.get("unixtimestamp"), m.get("participant"), m.get("text"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(m)
+    out.sort(key=lambda x: x.get("unixtimestamp", 0))
+    return out
+
+
+# ------------------------------
+# Main Backup Class
+# ------------------------------
 class TimeMessageBackup:
+    """Main class handling backing up chat messages and attachments into an output folder.
 
-    def __init__(self, config):
+    The class copies the supplied chat.db into a temporary working directory to avoid
+    touching the original database during processing. Attachments are copied individually
+    from their original locations into the temporary directory and then into the final
+    backup directory for each contact.
+    """
 
+    @beartype
+    def __init__(self, config: Config):
+        """Create a temporary working directory and copy chat.db into it.
+
+        Args:
+            config: Config dataclass instance.
+
+        Raises:
+            PermissionError: If chat.db cannot be read (suggest Full Disk Access).
+            FileNotFoundError: If chat.db does not exist.
+        """
         self.config = config
+        self.output_dir = config.output
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.connection = None
-        self.cursors = None
+        # Temporary working directory
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="time_message_")
+        self.temp_path = Path(self.temp_dir.name)
+        logger.debug(f"Temporary working directory: {self.temp_path}")
 
-        self.conversations = []
+        # Copy only the chat.db file into temp for safe reads
+        self.db_path = self.temp_path / config.database.name
+        try:
+            shutil.copy2(config.database, self.db_path)
+            logger.info(
+                f"📁 Copied chat database to temporary location: {self.db_path}"
+            )
+            console.print(
+                f"📁 Copied chat database to temporary location: [bold]{self.db_path}[/]"
+            )
+        except PermissionError:
+            logger.error(
+                f"❌ Cannot access database at {config.database}. "
+                "Make sure your Terminal has Full Disk Access (System Settings → Privacy & Security → Full Disk Access)."
+            )
+            console.print(
+                f"❌ [red]Cannot access database at {config.database}.[/]\n"
+                "Make sure Terminal has Full Disk Access (System Settings → Privacy & Security → Full Disk Access)."
+            )
+            raise
+        except FileNotFoundError:
+            logger.error(f"❌ Database file not found: {config.database}")
+            console.print(f"❌ [red]Database file not found:[/red] {config.database}")
+            raise
 
-        self.__done = False
+    @beartype
+    def cleanup(self) -> None:
+        """Cleanup the temporary working directory."""
+        try:
+            self.temp_dir.cleanup()
+            logger.info("🧹 Temporary working directory cleaned up.")
+        except Exception as exc:
+            logger.warning(f"Failed to cleanup temp directory: {exc}")
 
-        self.__connect()
+    @beartype
+    def list_conversations(self) -> list:
+        """Return a deduplicated list of conversation identifiers.
 
-    def __connect(self):
+        Returns:
+            List[str]: list of contact identifiers (phone/email).
+        """
+        query = "SELECT guid FROM chat;"
+        contacts: list = []
+        with sqlite_connection(self.db_path) as conn:
+            for row in conn.execute(query):
+                guid = row["guid"] if "guid" in row.keys() else row[0]
+                if not guid:
+                    continue
+                contacts.append(normalize_guid(guid))
+        # deduplicate preserving order
+        seen = set()
+        unique = []
+        for c in contacts:
+            if c not in seen:
+                seen.add(c)
+                unique.append(c)
+        logger.info(f"🔎 Found {len(unique)} conversations")
+        return unique
 
-        self.connection = sqlite3.connect(self.config.database_directory)
-        self.cursor = self.connection.cursor()
+    @beartype
+    def backup_chat(self, contact: str) -> None:
+        """Export messages for a single contact into output/<contact>/history.json.
 
-    def __in_progress(self):
-
-        def __animate(self):
-            animation = "|/-\\"
-            idx = 0
-            while not self.__done:
-                print("> Copying, do not interrupt", animation[idx % len(animation)], end="\r")
-                idx += 1
-                time.sleep(0.1)
-
-            self.__done = False
-
-        t = threading.Thread(target=__animate, args=(self,), daemon=True)
-        t.start()
-
-    def retrieve_conversations(self):
-
-        conversations = []
-        query = "select * from chat;"
-        for con in self.cursor.execute(query):
-
-            if (subs := "iMessage;+;chat") in con[1]:
-                conversations.append(con[1].replace(subs, ""))
-            elif (subs := "iMessage;-;") in con[1]:
-                conversations.append(con[1].replace(subs, ""))
-            elif (subs := "SMS;-;") in con[1]:
-                conversations.append(con[1].replace(subs, ""))
-            elif (subs := "SMS;+;") in con[1]:
-                conversations.append(con[1].replace(subs, ""))
-            elif (subs := "tel;+;") in con[1]:
-                conversations.append(con[1].replace(subs, ""))
-            elif (subs := "chat") in con[1]:
-                conversations.append(con[1].replace(subs, ""))
-
-        self.conversations = list(dict.fromkeys(conversations))  # Remove duplicates
-
-        log.info(f"Found {len(self.conversations)} conversations in database")
-
-        return self.conversations
-
-    def backup_chat(self, contact):
-
-        query = (f"""
-            select is_from_me, date, text from message where handle_id=(
-                select handle_id from chat_handle_join where chat_id=(
-                    select ROWID from chat where guid='iMessage;-;{contact}'
+        Args:
+            contact: Contact identifier string.
+        """
+        logger.info(f"💬 Backing up messages for {contact}")
+        guid = f"iMessage;-;{contact}"
+        query = """
+            SELECT is_from_me, date, text
+            FROM message
+            WHERE handle_id = (
+                SELECT handle_id
+                FROM chat_handle_join
+                WHERE chat_id = (
+                    SELECT ROWID FROM chat WHERE guid = ?
                 )
             );
-        """)
+        """
+        messages: list = []
+        with sqlite_connection(self.db_path) as conn:
+            for row in conn.execute(query, (guid,)):
+                is_from_me = row["is_from_me"] if "is_from_me" in row.keys() else row[0]
+                date_raw = row["date"] if "date" in row.keys() else row[1]
+                text = row["text"] if "text" in row.keys() else row[2]
+                unixts = apple_time_to_unix_seconds(date_raw)
+                ts_iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(unixts))
+                participant = (
+                    "me"
+                    if is_from_me == 1
+                    else contact
+                    if is_from_me == 0
+                    else f"unknown_{is_from_me}"
+                )
+                messages.append(
+                    {
+                        "unixtimestamp": unixts,
+                        "timestamp": ts_iso,
+                        "participant_id": str(is_from_me),
+                        "participant": participant,
+                        "text": "" if text is None else str(text),
+                    }
+                )
 
-        messages = {}
-        ts_offset = int(datetime.datetime.strptime("2001-01-01", "%Y-%m-%d").strftime("%s"))
-        for id, date, text in self.cursor.execute(query):
-            ts = date // 1000000000 + ts_offset
-            timestamp = datetime.datetime.fromtimestamp(int(ts))
-            if id == 1:
-                participant = "me"
-            elif id == 0:
-                participant = contact
-            else:
-                participant = f"unknown_{id}"
+        target_dir = self.output_dir / contact
+        target_dir.mkdir(parents=True, exist_ok=True)
+        history_file = target_dir / "history.json"
 
-            messages[str(ts)] = {
-                "unixtimestamp": ts,
-                "timestamp": str(timestamp),
-                "participant_id": str(id),
-                "participant": str(participant),
-                "text": str(text)
-            }
+        existing = load_existing_history(history_file)
+        combined = dedupe_messages(existing + messages)
+        with history_file.open("w", encoding="utf8") as fh:
+            json.dump(combined, fh, indent=4, ensure_ascii=False)
+        logger.success(f"✅ Saved {len(combined)} messages to {history_file}")
+        console.print(
+            f"✅ Saved [bold]{len(combined)}[/bold] messages to [green]{history_file}[/]"
+        )
 
-        if messages:
+    @beartype
+    def _attachment_sources_for_contact(self, contact: str) -> list[Path]:
+        """Query the DB and return the original attachment paths for a contact.
 
-            log.info(f"> Backing up {len(messages)} messages with {contact} ...")
+        Note: these original paths may be protected. We check existence and skip
+        inaccessible files. Copying happens later.
 
-            path = self.config.output_directory + "/" + str(contact)
-            os.makedirs(path, exist_ok=True)
-            try:
-                with open(f"{self.config.output_directory}/{contact}/history.json", "r", encoding="utf8") as f:
-                    backup = json.load(f)
+        Args:
+            contact: Contact identifier.
 
-                messages.update(backup)
-            except Exception:
-                pass
-
-            with open(f"{self.config.output_directory}/{contact}/history.json", "w", encoding="utf8") as f:
-                json.dump(messages, f, sort_keys=True, indent=4, ensure_ascii=True)
-
-            log.info(f"> Backup now contains {len(messages)} messages.")
-        else:
-            log.info(f"> No messages found with {contact} ...")
-
-    def backup_attachements(self, contact):
-
-        query = (f"""
-            select filename from attachment where rowid in (
-                select attachment_id from message_attachment_join where message_id in (
-                    select rowid from message where cache_has_attachments=1 and handle_id=(
-                        select handle_id from chat_handle_join where chat_id=(
-                            select ROWID from chat where guid='iMessage;-;{contact}'
+        Returns:
+            List[Path]: list of original attachment file paths (may be empty).
+        """
+        guid = f"iMessage;-;{contact}"
+        query = """
+            SELECT filename FROM attachment
+            WHERE rowid IN (
+                SELECT attachment_id FROM message_attachment_join
+                WHERE message_id IN (
+                    SELECT rowid FROM message WHERE cache_has_attachments=1 AND handle_id = (
+                        SELECT handle_id FROM chat_handle_join WHERE chat_id = (
+                            SELECT ROWID FROM chat WHERE guid = ?
                         )
                     )
                 )
-            )
-        """)
+            );
+        """
+        sources: list[Path] = []
+        with sqlite_connection(self.db_path) as conn:
+            for row in conn.execute(query, (guid,)):
+                raw = row["filename"] if "filename" in row.keys() else row[0]
+                if not raw:
+                    continue
+                p = Path(raw).expanduser()
+                # If the DB stored a tilde-less relative path, try to resolve it.
+                if not p.is_absolute():
+                    p = (Path.home() / p).resolve()
+                sources.append(p)
+        return sources
 
-        filepaths = []
-        for path in self.cursor.execute(query):
-            path = path[0]
-            if "~" in path:
-                path = path.replace("~", "")
-                path = str(pathlib.Path.home()) + path
-                path = pathlib.Path(path)
-            else:
-                path = pathlib.Path(path)
+    @beartype
+    def _copy_attachments_to_temp(self, source_paths: list[Path]) -> list[Path]:
+        """Copy a list of source attachment files into the temp attachments folder.
 
-            filepaths.append(path)
+        Shows a progress bar and skips files that are missing or inaccessible.
 
-        if filepaths:
+        Args:
+            source_paths: List of Path objects pointing to original attachment files.
 
-            self.__in_progress()
-            log.info(f"> Backing up {len(filepaths)} attachements with {contact} ...")
-            for path in filepaths:
-                log.debug(f"  > Backing up {path} ...")
-                directory = f"{self.config.output_directory}/{contact}/attachements/"
-                os.makedirs(directory, exist_ok=True)
+        Returns:
+            List[Path]: paths of copied files inside the temp attachments folder.
+        """
+        copied: list[Path] = []
+        dest_base = self.temp_path / "attachments"
+        dest_base.mkdir(parents=True, exist_ok=True)
 
+        total = len(source_paths)
+        if total == 0:
+            return []
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            transient=True,
+        ) as progress:
+            task = progress.add_task("🔁 Copying attachments to temp", total=total)
+            for src in source_paths:
                 try:
-                    shutil.copy2(path, directory)
-                except FileNotFoundError:
-                    log.warning(f"  > File not found: {path}")
+                    if not src.exists():
+                        logger.warning(f"Attachment not found or inaccessible: {src}")
+                        progress.advance(task)
+                        continue
+                    dest = dest_base / src.name
+                    shutil.copy2(src, dest)
+                    copied.append(dest)
+                except PermissionError:
+                    logger.warning(f"Permission denied copying attachment: {src}")
+                except Exception as exc:
+                    logger.warning(f"Failed to copy {src}: {exc}")
+                progress.advance(task)
+        logger.info(f"Copied {len(copied)}/{total} attachments to temp")
+        return copied
 
-            self.__done = True
+    @beartype
+    def backup_attachments(self, contact: str) -> None:
+        """Copy attachments for a contact from temp into the final output directory.
 
-        else:
-            log.info(f"> No attachements found with {contact} ...")
+        Steps:
+            - Query DB for attachment original paths
+            - Copy accessible attachments into temp (with progress)
+            - Copy temp attachments into final output/<contact>/attachments (with progress)
 
-    def start(self):
+        Args:
+            contact: Contact identifier.
+        """
+        console.print(f"📎 Processing attachments for [bold]{contact}[/bold]...")
+        sources = self._attachment_sources_for_contact(contact)
+        if not sources:
+            logger.info(f"No attachments found for {contact}")
+            console.print(f"ℹ️  No attachments found for {contact}")
+            return
 
-        log.info(f"Starting backups from {self.config.database_directory} ...")
-        self.retrieve_conversations()
+        # Copy originals into temp (reads original protected locations once)
+        temp_copied = self._copy_attachments_to_temp(sources)
+        if not temp_copied:
+            console.print(
+                f"⚠️  No accessible attachments could be copied for {contact}."
+            )
+            return
 
-        for contact in self.conversations:
-            log.info(f"Backup of contact {contact}:")
-            self.backup_chat(contact)
-            self.backup_attachements(contact)
+        # Now copy from temp to final output location with a progress bar
+        dest_dir = self.output_dir / contact / "attachments"
+        dest_dir.mkdir(parents=True, exist_ok=True)
 
-        log.info(f"Backups are stored in the target directory {self.config.output_directory}/")
+        total = len(temp_copied)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            transient=True,
+        ) as progress:
+            task = progress.add_task(
+                f"📂 Writing attachments for {contact}", total=total
+            )
+            for tpath in temp_copied:
+                try:
+                    # final write
+                    shutil.copy2(tpath, dest_dir)
+                except Exception as exc:
+                    logger.warning(f"Failed to copy {tpath} -> {dest_dir}: {exc}")
+                progress.advance(task)
 
-
-def configure_logger():
-
-    formatter = logging.Formatter('%(asctime)s [%(levelname)7s] %(message)s')
-
-    stream_handler = logging.StreamHandler(sys.stdout)  # Writes into ``sys.stderr`` on default
-    stream_handler.setFormatter(formatter)
-    log.addHandler(stream_handler)
-
-    file_handler = logging.FileHandler("backup.log")
-    file_handler.setFormatter(formatter)
-    log.addHandler(file_handler)
-
-    log.setLevel(logging.INFO)
-
-    return log
-
-
-def main():
-
-    argumentParser = argparse.ArgumentParser(
-        description=(
-            "TimeMessage - an macOS iMessage Backup Script"
-            "Backs up locally stored conversations of timestamped texts and available attachements.\n"
-            "DISCLAIMER\n"
-            "THIS SCRIPT DOES NOT COME WITH ANY GUARANTEE, LIKE COMPLETENESS OF BACKUPS.\n"
-            "MIT LICENSE APPLIES. CHECK THE SOURCE CODE. EVALUATE THE CODE FOR YOUR OWN ENVIRONMENT.\n"
-            "USE AT YOUR OWN RISK! ENCRYPT BACKUPS YOURSELF!"
+        logger.success(f"📁 Attachments for {contact} copied to {dest_dir}")
+        console.print(
+            f"📁 Attachments for [bold]{contact}[/bold] copied to [green]{dest_dir}[/green]"
         )
-    )
 
-    timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H-%M")
+    @beartype
+    def backup_all(self, contacts: Iterable[str]) -> None:
+        """Backup multiple contacts, cleaning up temp directory when finished.
 
-    argumentParser.add_argument(
-        "-db",
-        "--database_directory",
-        type=str,
-        default="",
-        help="Specifies the iMessage directory (string, default: ~/Library/Messages/)."
+        Args:
+            contacts: Iterable of contact identifier strings.
+        """
+        try:
+            for c in contacts:
+                console.rule(f"🔹 Backing up {c}")
+                logger.info(f"----- Contact: {c} -----")
+                self.backup_chat(c)
+                if self.config.include_attachments:
+                    self.backup_attachments(c)
+        finally:
+            self.cleanup()
+
+
+# ------------------------------
+# CLI
+# ------------------------------
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build and return the argument parser for the CLI."""
+    p = argparse.ArgumentParser(
+        prog="timemessage", description="Backup iMessage (chat.db) conversations."
     )
-    argumentParser.add_argument(
+    p.add_argument(
+        "--db",
+        "-d",
+        type=Path,
+        default=Path.home() / "Library/Messages/chat.db",
+        help="Path to chat.db",
+    )
+    p.add_argument(
+        "--out",
         "-o",
-        "--output_directory",
+        type=Path,
+        default=Path(f"iMessage.backup_{time.strftime('%Y-%m-%d_%H-%M')}"),
+        help="Output directory for backups",
+    )
+    p.add_argument("--yes", "-y", action="store_true", help="Assume yes for prompts")
+    p.add_argument(
+        "--no-attachments", action="store_true", help="Skip copying attachments"
+    )
+    p.add_argument(
+        "--log", default="INFO", help="Log level (DEBUG, INFO, WARNING, ERROR)"
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("list", help="List available conversations")
+    backup = sub.add_parser("backup", help="Backup conversations")
+    backup.add_argument(
+        "--contact",
+        "-c",
         type=str,
-        default=f"iMessage.backup_{timestamp}",
-        help="Specifies output directory of the backup (string, default: iMessage.backup_YYYY-mm-dd_HH-MM)."
+        nargs="*",
+        help="Specific contact(s) to backup (defaults to all)",
+    )
+    backup.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List what would be backed up without writing files",
+    )
+    return p
+
+
+def confirm(prompt: str) -> bool:
+    """Ask the user to confirm a prompt, returning True for yes."""
+    ans = input(f"{prompt} [y/N]: ").strip().lower()
+    return ans in ("y", "yes")
+
+
+@beartype
+def main(argv: Optional[list[str]] = None) -> int:
+    """Main entrypoint for the CLI.
+
+    Args:
+        argv: Optional list of argv strings (for testing).
+
+    Returns:
+        Exit code int.
+    """
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    cfg = Config(
+        database=args.db,
+        output=args.out,
+        yes=args.yes,
+        include_attachments=not args.no_attachments,
+        loglevel=args.log,
     )
 
-    config = argumentParser.parse_args()
+    # Configure loguru
+    logger.remove()
+    logger.add(lambda msg: print(msg, end=""), level=cfg.loglevel.upper())
 
-    if not config.database_directory:
-        config.database_directory = pathlib.Path.home().joinpath("Library", "Messages", "chat.db")
-        log.info("No explicit path given as argument, using system standard.")
+    if not cfg.database.exists():
+        logger.error(f"❌ Database not found: {cfg.database}")
+        console.print(f"❌ [red]Database not found:[/red] {cfg.database}")
+        return 2
 
-    print(config)
-    configure_logger()
+    try:
+        backup = TimeMessageBackup(cfg)
+    except Exception:
+        # message already logged / printed
+        return 3
 
-    backup = TimeMessageBackup(config)
+    if args.command == "list":
+        contacts = backup.list_conversations()
+        for c in contacts:
+            console.print(f"• {c}")
+        # cleanup before exit
+        backup.cleanup()
+        return 0
 
-    print(
-        "\n"
-        "# TimeMessage \n"
-        "##############\n"
-    )
+    if args.command == "backup":
+        contacts = args.contact or backup.list_conversations()
+        if not contacts:
+            logger.info("ℹ️ No conversations found to backup.")
+            console.print("ℹ️  No conversations found to backup.")
+            backup.cleanup()
+            return 0
 
-    msg = f"Really backup from {config.database_directory} to {config.output_directory}"
-    agreed = input("%s (y/N): " % msg).lower() == "y"
-    if not agreed:
-        print("No. Abort.")
-        exit(0)
-    else:
-        print("Careful, ensure to encrypt the output directory afterwards. The backup itself is unencrypted!")
+        console.print(
+            f"📦 Backing up [bold]{len(contacts)}[/bold] conversation(s) to [green]{cfg.output}[/green]"
+        )
+        if not cfg.yes and not args.dry_run:
+            if not confirm(
+                f"Really backup {len(contacts)} conversation(s) from {cfg.database} to {cfg.output}?"
+            ):
+                logger.info("Abort by user")
+                console.print("Abort by user")
+                backup.cleanup()
+                return 0
 
-    backup.start()
+        if args.dry_run:
+            for c in contacts:
+                console.print(
+                    f"Would backup: {c} (attachments: {cfg.include_attachments})"
+                )
+            backup.cleanup()
+            return 0
+
+        backup.backup_all(contacts)
+        logger.success(f"🎉 Backups stored in {cfg.output}")
+        console.print(f"🎉 Backups stored in [bold]{cfg.output}[/bold]")
+        return 0
+
+    logger.error("Unknown command")
+    backup.cleanup()
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,10 +1,19 @@
 # TimeMessage
-iMessage.*/
+iMessage*/
+*.db
 *.log
+
+# Tools
+.ruff_cache/
 
 # Python
 __pycache__/
-*py*env/
+.venv/
+*.egg-info/
+
+# Build & Dist
+build/
+dist/
 
 # IDEs
 .vscode/

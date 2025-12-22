@@ -1,0 +1,21 @@
+[project]
+name = "timemessage"
+version = "0.1.0"
+description = "iMessage backup utility"
+authors = [{ name = "Thomas Rudolf", email = "thomas.rudolf@kit.edu" }]
+requires-python = ">=3.12"
+
+dependencies = [
+    "beartype>=0.22.5",
+    "loguru>=0.7.3",
+    "rich>=14.2.0",
+]
+
+[project.scripts]
+timemessage = "timemessage:main"
+
+[dependency-groups]
+dev = ["ruff>=0.14.4"]
+
+[tool.uv]
+package = true
