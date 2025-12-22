@@ -1,0 +1,10 @@
+# iMessageBackup
+iMessage.*/
+*.log
+
+# Python
+__pycache__/
+*py*env/
+
+# IDEs
+.vscode/
