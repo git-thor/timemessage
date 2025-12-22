@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-time_message_backup.py
+timemessage.py
 
 Modern iMessage backup tool using Loguru, Rich, and beartype for Python 3.12+.
 
@@ -10,8 +10,8 @@ final backup to the output directory. The temporary working directory is
 cleaned up automatically.
 
 Usage:
-    time_message_backup list --db ~/Library/Messages/chat.db
-    time_message_backup backup --db ~/Library/Messages/chat.db --out ~/iMessage.backups
+    timemessage list --db ~/Library/Messages/chat.db
+    timemessage backup --db ~/Library/Messages/chat.db --out ~/iMessage.backups
 """
 
 import argparse
@@ -192,7 +192,7 @@ class TimeMessageBackup:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Temporary working directory
-        self.temp_dir = tempfile.TemporaryDirectory(prefix="time_message_")
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="timemessage_")
         self.temp_path = Path(self.temp_dir.name)
         log.debug(f"Temporary working directory: {self.temp_path}")
 

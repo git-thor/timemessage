@@ -41,7 +41,7 @@ Using **uv** (recommended for package management):
 uv tool install git+https://github.com/git-thor/timemessage.git
 ```
 
-This installs the `time-message-backup` CLI globally.
+This installs the `timemessage` CLI globally.
 
 ---
 
@@ -52,7 +52,7 @@ Once installed, you can use the CLI with the following commands:
 ### List available conversations
 
 ```bash
-time-message-backup list --db ~/Library/Messages/chat.db
+timemessage list --db ~/Library/Messages/chat.db
 ```
 
 * `--db` : Optional path to your `chat.db`. Defaults to `~/Library/Messages/chat.db`.
@@ -60,7 +60,7 @@ time-message-backup list --db ~/Library/Messages/chat.db
 ### Backup all conversations
 
 ```bash
-time-message-backup backup --db ~/Library/Messages/chat.db --out ~/iMessage.backups
+timemessage backup --db ~/Library/Messages/chat.db --out ~/iMessage.backups
 ```
 
 * `--out` : Optional output directory. Default: `iMessage.backup_YYYY-mm-dd_HH-MM`
@@ -71,7 +71,7 @@ time-message-backup backup --db ~/Library/Messages/chat.db --out ~/iMessage.back
 ### Backup specific contacts
 
 ```bash
-time-message-backup backup --contact "+1234567890" "example@mail.com"
+timemessage backup --contact "+1234567890" "example@mail.com"
 ```
 
 ---
